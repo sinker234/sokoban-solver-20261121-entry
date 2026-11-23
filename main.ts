@@ -181,16 +181,18 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
   const solved = (boxes: number[]): boolean => boxes.every((b) => goalSet[b]);
 
   // State key: the region's lowest square, then the sorted box squares, digits in base `size`.
-  const keyOf = (boxes: number[], low: number): number => {
-    let k = low;
-    for (const b of boxes) k = k * size + b;
+  // BigInt, not a number: a double aliases distinct states once size ** (boxes + 1) exceeds 2 ** 53
+  // (a 6-box room on a 575-square board already overflows), which silently drops pushes and whole rooms.
+  const keyOf = (boxes: number[], low: number): bigint => {
+    let k = BigInt(low);
+    for (const b of boxes) k = k * BigInt(size) + BigInt(b);
     return k;
   };
-  const decodeBoxes = (key: number, n: number): number[] => {
+  const decodeBoxes = (key: bigint, n: number): number[] => {
     const boxes = new Array<number>(n);
     for (let i = n - 1; i >= 0; i--) {
-      boxes[i] = key % size;
-      key = Math.floor(key / size);
+      boxes[i] = Number(key % BigInt(size));
+      key /= BigInt(size);
     }
     return boxes;
   };
@@ -278,12 +280,12 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
    */
   const bfsFallback = (): { pushes: number; moves: string } | null => {
     bestG.clear();
-    const bKeys: number[] = [];
+    const bKeys: bigint[] = [];
     const bPlayers: number[] = [];
     const bParents: number[] = [];
     const bPushFrom: number[] = [];
     const bPushDir: number[] = [];
-    const seenKeys = new Set<number>();
+    const seenKeys = new Set<bigint>();
     const queue: number[] = [];
     for (const b of level.boxes) occupied[b] = 1;
     const low0 = reach(seen, 'seen', occupied, level.player);
@@ -314,7 +316,7 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
           occupied[b] = 0;
           occupied[t] = 1;
           const frozen = frozenBlock(occupied, t);
-          let key = -1;
+          let key: bigint = -1n;
           let next: number[] | null = null;
           if (!frozen) {
             next = boxes.slice();
@@ -324,7 +326,7 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
           }
           occupied[t] = 0;
           occupied[b] = 1;
-          if (key < 0 || seenKeys.has(key)) continue;
+          if (key < 0n || seenKeys.has(key)) continue;
           if (bKeys.length >= BFS_MAX_STATES) {
             for (const x of boxes) occupied[x] = 0;
             return null;
@@ -349,14 +351,14 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
   };
 
   // States, in creation order: key, parent, the square the pushed box left, the push direction, pushes so far, estimate.
-  const keys: number[] = [];
+  const keys: bigint[] = [];
   const players: number[] = [];
   const parents: number[] = [];
   const pushFrom: number[] = [];
   const pushDir: number[] = [];
   const gs: number[] = [];
   const hs: number[] = [];
-  const bestG = new Map<number, number>();
+  const bestG = new Map<bigint, number>();
 
   const h0 = assignmentBound(level.boxes, goalDist);
   if (h0 === Infinity) return null;
@@ -421,7 +423,7 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
         occupied[b] = 0;
         occupied[t] = 1;
         const frozen = frozenBlock(occupied, t);
-        let key = -1;
+        let key: bigint = -1n;
         let next: number[] | null = null;
         let h = Infinity;
         if (!frozen) {
@@ -435,7 +437,7 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
         }
         occupied[t] = 0;
         occupied[b] = 1;
-        if (key < 0 || bestG.has(key) && bestG.get(key)! <= gs[s]! + 1) continue;
+        if (key < 0n || bestG.has(key) && bestG.get(key)! <= gs[s]! + 1) continue;
         if (keys.length >= MAX_STATES) {
           exhausted = true;
           break;
