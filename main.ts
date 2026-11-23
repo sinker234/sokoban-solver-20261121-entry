@@ -5,7 +5,9 @@
 // and a box that leaves its room can never come back, so the level's push-optimal
 // count is the sum of the rooms' optima. The solver therefore
 //   1. splits a level into rooms by cutting the hallway's dead squares out of the floor,
-//   2. solves each room push-optimally with A* over pushes, and
+//   2. solves each room push-optimally with A* over pushes, falling back to
+//      a push-by-push breadth-first search if the A* ever runs out of states,
+//      and
 //   3. concatenates the rooms' move sequences, walking the player between rooms.
 //
 // The per-room A* searches push states (sorted box squares + the player's reachable
@@ -34,6 +36,12 @@ const DIRS: [number, number, string, string][] = [
 
 /** The most states one room's search may create before it gives up: work, never the clock. */
 const MAX_STATES = 500_000;
+/**
+ * The most states the breadth-first fallback may create. The generator keeps a
+ * room only when its own breadth-first search solves it within 250,000 states,
+ * so this cap sits above every room the generator can draw.
+ */
+const BFS_MAX_STATES = 400_000;
 
 interface Level {
   w: number;
@@ -157,7 +165,10 @@ function popcount(x: number): number {
 /**
  * Push-optimal solution of one (sub-)level by A* over pushes, or null when the
  * search gives up. `level` carries the walls (other rooms' boxes included),
- * the room's own goals and boxes, and the player's square.
+ * the room's own goals and boxes, and the player's square. When the A* runs
+ * out of states it falls back to a push-by-push breadth-first search (the
+ * search the generator itself keeps every room solvable by), so a room the
+ * generator can draw still gets its push-optimal answer instead of nothing.
  */
 function solveRoom(level: Level): { pushes: number; moves: string } | null {
   const { w, wall, goals } = level;
@@ -231,6 +242,112 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
   const occupied = new Uint8Array(size);
   for (const b of level.boxes) occupied[b] = 1;
 
+  // Rebuild the moves for the state `foundIdx` of a search kept in the given
+  // parent/push arrays: for each push, walk to the pushing square, then push.
+  const buildMoves = (
+    parentsArr: number[], pushFromArr: number[], pushDirArr: number[], foundIdx: number,
+  ): { pushes: number; moves: string } => {
+    const path: number[] = [];
+    for (let s = foundIdx; s > 0; s = parentsArr[s]!) path.push(s);
+    path.reverse();
+    let moves = '';
+    let player = level.player;
+    let boxes = level.boxes;
+    for (const s of path) {
+      const from = pushFromArr[s]!;
+      const k = pushDirArr[s]!;
+      const [dx, dy, , pushLetter] = DIRS[k]!;
+      const d = dy * w + dx;
+      const to = from + d;
+      for (const b of boxes) occupied[b] = 1;
+      moves += walkTo(level, occupied, player, from - d);
+      for (const b of boxes) occupied[b] = 0;
+      moves += pushLetter;
+      player = from;
+      boxes = boxes.map((b) => (b === from ? to : b)).sort((a, b) => a - b);
+    }
+    return { pushes: path.length, moves };
+  };
+
+  /**
+   * The same room solved by breadth-first search over pushes, expanding
+   * states in order of pushes made, so the first solved state met is
+   * push-optimal. Same state keys, same deadlock pruning, same fixed
+   * direction order, so the answer is deterministic. Used only when the A*
+   * above runs out of states.
+   */
+  const bfsFallback = (): { pushes: number; moves: string } | null => {
+    bestG.clear();
+    const bKeys: number[] = [];
+    const bPlayers: number[] = [];
+    const bParents: number[] = [];
+    const bPushFrom: number[] = [];
+    const bPushDir: number[] = [];
+    const seenKeys = new Set<number>();
+    const queue: number[] = [];
+    for (const b of level.boxes) occupied[b] = 1;
+    const low0 = reach(seen, 'seen', occupied, level.player);
+    for (const b of level.boxes) occupied[b] = 0;
+    const k0 = keyOf(level.boxes, low0);
+    bKeys.push(k0);
+    bPlayers.push(level.player);
+    bParents.push(-1);
+    bPushFrom.push(-1);
+    bPushDir.push(-1);
+    seenKeys.add(k0);
+    queue.push(0);
+    let head = 0;
+    let foundB = solved(level.boxes) ? 0 : -1;
+    while (head < queue.length && foundB < 0) {
+      const s = queue[head++]!;
+      const boxes = decodeBoxes(bKeys[s]!, n);
+      for (const b of boxes) occupied[b] = 1;
+      reach(seen, 'seen', occupied, bPlayers[s]!);
+      const regionStamp = stamps.seen;
+      for (let bi = 0; bi < n && foundB < 0; bi++) {
+        const b = boxes[bi]!;
+        for (let k = 0; k < 4; k++) {
+          const [dx, dy] = DIRS[k]!;
+          const d = dy * w + dx;
+          const t = b + d;
+          if (seen[b - d] !== regionStamp || wall[t] || occupied[t] || !live[t]) continue;
+          occupied[b] = 0;
+          occupied[t] = 1;
+          const frozen = frozenBlock(occupied, t);
+          let key = -1;
+          let next: number[] | null = null;
+          if (!frozen) {
+            next = boxes.slice();
+            next[bi] = t;
+            next.sort((a, bb) => a - bb);
+            if (next.every((x) => live[x])) key = keyOf(next, reach(markSeen, 'mark', occupied, b));
+          }
+          occupied[t] = 0;
+          occupied[b] = 1;
+          if (key < 0 || seenKeys.has(key)) continue;
+          if (bKeys.length >= BFS_MAX_STATES) {
+            for (const x of boxes) occupied[x] = 0;
+            return null;
+          }
+          seenKeys.add(key);
+          bKeys.push(key);
+          bPlayers.push(b);
+          bParents.push(s);
+          bPushFrom.push(b);
+          bPushDir.push(k);
+          queue.push(bKeys.length - 1);
+          if (solved(next!)) {
+            foundB = bKeys.length - 1;
+            break;
+          }
+        }
+      }
+      for (const x of boxes) occupied[x] = 0;
+    }
+    if (foundB < 0) return null;
+    return buildMoves(bParents, bPushFrom, bPushDir, foundB);
+  };
+
   // States, in creation order: key, parent, the square the pushed box left, the push direction, pushes so far, estimate.
   const keys: number[] = [];
   const players: number[] = [];
@@ -286,14 +403,15 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
   };
 
   let found = solved(level.boxes) ? 0 : -1;
-  while (heap.length > 0 && found < 0) {
+  let exhausted = false;
+  while (heap.length > 0 && found < 0 && !exhausted) {
     const [, , , s] = heapPop();
     if (bestG.get(keys[s]!) !== gs[s]) continue; // a better route to this state was found
     const boxes = decodeBoxes(keys[s]!, n);
     for (const b of boxes) occupied[b] = 1;
     reach(seen, 'seen', occupied, players[s]!);
     const regionStamp = stamps.seen;
-    for (let bi = 0; bi < n && found < 0; bi++) {
+    for (let bi = 0; bi < n && found < 0 && !exhausted; bi++) {
       const b = boxes[bi]!;
       for (let k = 0; k < 4; k++) {
         const [dx, dy] = DIRS[k]!;
@@ -319,8 +437,8 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
         occupied[b] = 1;
         if (key < 0 || bestG.has(key) && bestG.get(key)! <= gs[s]! + 1) continue;
         if (keys.length >= MAX_STATES) {
-          for (const x of boxes) occupied[x] = 0;
-          return null;
+          exhausted = true;
+          break;
         }
         bestG.set(key, gs[s]! + 1);
         keys.push(key);
@@ -339,29 +457,14 @@ function solveRoom(level: Level): { pushes: number; moves: string } | null {
     }
     for (const x of boxes) occupied[x] = 0;
   }
-  if (found < 0) return null;
-
-  // Rebuild the moves: for each push, walk to the pushing square, then push.
-  const path: number[] = [];
-  for (let s = found; s > 0; s = parents[s]!) path.push(s);
-  path.reverse();
-  let moves = '';
-  let player = level.player;
-  let boxes = level.boxes;
-  for (const s of path) {
-    const from = pushFrom[s]!;
-    const k = pushDir[s]!;
-    const [dx, dy, , pushLetter] = DIRS[k]!;
-    const d = dy * w + dx;
-    const to = from + d;
-    for (const b of boxes) occupied[b] = 1;
-    moves += walkTo(level, occupied, player, from - d);
-    for (const b of boxes) occupied[b] = 0;
-    moves += pushLetter;
-    player = from;
-    boxes = boxes.map((b) => (b === from ? to : b)).sort((a, b) => a - b);
+  if (found < 0) {
+    // The A* ran out of states: the breadth-first fallback still returns the
+    // push-optimal answer for any room the generator could draw. Only a room
+    // no search can solve returns null.
+    if (exhausted) return bfsFallback();
+    return null;
   }
-  return { pushes: path.length, moves };
+  return buildMoves(parents, pushFrom, pushDir, found);
 }
 
 /** Shortest walk from `from` to `to` around walls and boxes, lower LURD letters (first direction first on ties). */
